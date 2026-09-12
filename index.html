@@ -112,13 +112,28 @@
   .bar.now{border-color:var(--primary); box-shadow:0 0 0 2px var(--primary-soft)}
   .bar.deload .stick i{background:linear-gradient(180deg,#7ad8cd,#12b8a6)}
   .bar small{font-size:11px; color:var(--muted); display:block; margin-top:5px}
-  label.f{display:block; margin-bottom:12px}
-  label.f > span{display:block; font-size:13px; font-weight:650; color:#415062; margin-bottom:5px}
-  label.f input,label.f select{
+  .f{display:block; margin-bottom:12px}
+  .f > span{display:block; font-size:13px; font-weight:650; color:#415062; margin-bottom:5px}
+  .f input,.f select{
     width:100%; padding:11px 12px; border:1px solid var(--line); border-radius:11px;
     font-size:15px; font-family:inherit; background:#fff; color:var(--ink);
   }
-  label.f input:focus,label.f select:focus{outline:2px solid var(--primary-soft); border-color:var(--primary)}
+  .f input:focus,.f select:focus{outline:2px solid var(--primary-soft); border-color:var(--primary)}
+  .preset-row{display:flex; gap:6px; flex-wrap:wrap; margin:2px 0 9px}
+  .preset{
+    border:1px solid var(--line); background:#f6f8fb; color:#5a6a7d; border-radius:999px;
+    padding:5px 12px; font-size:12.5px; font-weight:650; font-family:inherit; cursor:pointer; transition:.15s;
+  }
+  .preset[aria-pressed="true"]{background:var(--primary-soft); border-color:#ffd9c6; color:#c2491a}
+  .wd-picker{display:flex; gap:6px}
+  .wd-btn{
+    flex:1; min-width:0; border:1px solid var(--line); background:#fff; color:#415062;
+    border-radius:11px; padding:11px 0; font-size:15px; font-weight:650; font-family:inherit; cursor:pointer; transition:.15s;
+  }
+  .wd-btn[aria-pressed="true"]{background:var(--primary); border-color:var(--primary); color:#fff}
+  .preset:active,.wd-btn:active{transform:scale(.97)}
+  .wd-hint{font-size:12.5px; color:var(--muted); margin-top:8px; min-height:18px}
+  .wd-hint.warn{color:#a86a06}
   .grid2{display:grid; grid-template-columns:1fr 1fr; gap:11px}
   .kv{display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px dashed var(--line); font-size:14px}
   .kv:last-child{border-bottom:0}
@@ -214,15 +229,19 @@
     gym:             '健身房'
   };
 
-  var WEEKDAY_PATTERNS = {
+  /* 推荐预设：仅用于「推荐排布」快捷按钮与旧数据迁移；实际排期以 profile.trainingWeekdays 为准 */
+  var WEEKDAY_PRESETS = {
+    1: [2],
     2: [0, 3],
     3: [0, 2, 4],
     4: [0, 1, 3, 4],
     5: [0, 1, 2, 4, 5],
-    6: [0, 1, 2, 3, 4, 5]
+    6: [0, 1, 2, 3, 4, 5],
+    7: [0, 1, 2, 3, 4, 5, 6]
   };
 
   var WEEKDAY_CN = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+  var WEEKDAY_SHORT = ['一', '二', '三', '四', '五', '六', '日'];
 
   var DB_SIZES = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 22.5, 25, 27.5, 30, 32.5, 35];
 
@@ -551,15 +570,48 @@
   }
 
   /* ------------------------------------------------------------------ 配置规范化 */
+  /* 把任意输入整理成合法的星期集合：只保留 0–6 的整数，去重并升序 */
+  function normalizeWeekdays(list) {
+    var out = [], seen = {};
+    if (Object.prototype.toString.call(list) === '[object Array]') {
+      for (var i = 0; i < list.length; i++) {
+        var v = Math.round(Number(list[i]));
+        if (isFinite(v) && v >= 0 && v <= 6 && !seen[v]) { seen[v] = 1; out.push(v); }
+      }
+    }
+    return out.sort(function (a, b) { return a - b; });
+  }
+  /* 预设排布，接受 1–7 天（用于「推荐排布」按钮与默认值） */
+  function presetWeekdays(count) {
+    var c = Math.round(Number(count));
+    if (!isFinite(c)) c = 3;
+    c = Math.min(7, Math.max(1, c));
+    return WEEKDAY_PRESETS[c].slice();
+  }
+  /* 旧字段 daysPerWeek 的迁移语义与历史版本保持一致（2–6 天） */
+  function legacyDays(days) {
+    var d = Math.min(6, Math.max(2, Math.round(Number(days) || 3)));
+    if (!WEEKDAY_PRESETS[d]) d = 3;
+    return d;
+  }
+
   function normalizeProfile(raw) {
     var p = raw || {};
-    var days = Math.min(6, Math.max(2, Math.round(Number(p.daysPerWeek) || 3)));
-    if (!WEEKDAY_PATTERNS[days]) days = 3;
+    var weekdays = p.trainingWeekdays != null
+      ? normalizeWeekdays(p.trainingWeekdays)
+      : WEEKDAY_PRESETS[legacyDays(p.daysPerWeek)].slice();
+    if (!weekdays.length) {
+      weekdays = p.daysPerWeek != null
+        ? WEEKDAY_PRESETS[legacyDays(p.daysPerWeek)].slice()
+        : WEEKDAY_PRESETS[3].slice();
+    }
+    if (!weekdays.length) weekdays = WEEKDAY_PRESETS[3].slice();
     return {
       heightCm: Number(p.heightCm) || 170,
       weightKg: Number(p.weightKg) || 65,
       goal: GOALS[p.goal] ? p.goal : 'recomp',
-      daysPerWeek: days,
+      trainingWeekdays: weekdays,
+      daysPerWeek: weekdays.length,
       experience: EXPERIENCE[p.experience] ? p.experience : 'beginner',
       venue: VENUES[p.venue] ? p.venue : 'home_bodyweight',
       startDate: /^\d{4}-\d{2}-\d{2}$/.test(String(p.startDate || '')) ? p.startDate : toISO(new Date())
@@ -570,14 +622,26 @@
     var h = Number(raw && raw.heightCm), w = Number(raw && raw.weightKg);
     if (!(h >= 100 && h <= 250)) errs.push('身高需在 100–250 cm 之间');
     if (!(w >= 30 && w <= 250)) errs.push('体重需在 30–250 kg 之间');
-    if (raw && raw.daysPerWeek != null && !WEEKDAY_PATTERNS[Number(raw.daysPerWeek)]) errs.push('每周训练天数需在 2–6 天之间');
+    if (raw && raw.trainingWeekdays != null) {
+      if (!normalizeWeekdays(raw.trainingWeekdays).length) errs.push('请至少选择 1 个训练日');
+    } else if (raw && raw.daysPerWeek != null && !WEEKDAY_PRESETS[Number(raw.daysPerWeek)]) {
+      errs.push('每周训练天数需在 1–7 天之间');
+    }
     return errs;
   }
 
   /* ------------------------------------------------------------------ 分化模板 */
   function splitFor(daysPerWeek, experience) {
-    var d = normalizeProfile({ daysPerWeek: daysPerWeek, experience: experience }).daysPerWeek;
+    var d = Math.round(Number(daysPerWeek));
+    if (!isFinite(d) || d < 1) d = 3;
+    if (d > 7) d = 7;
     var adv = experience === 'intermediate' || experience === 'advanced';
+    if (d === 1) {
+      return [
+        { name: '全身综合', focus: '蹲 · 推 · 拉 · 髋 · 臀 · 核心',
+          slots: ['squat', 'horizontal_push', 'horizontal_pull', 'hinge', 'glute', 'core'] }
+      ];
+    }
     if (d === 2) {
       return [
         { name: '全身 A', focus: '下肢 · 推 · 拉', slots: ['squat', 'horizontal_push', 'horizontal_pull', 'hinge', 'core'] },
@@ -615,7 +679,7 @@
         { name: '下肢（后链为主）', focus: '下肢', slots: ['hinge', 'lunge', 'glute', 'calf', 'core'] }
       ];
     }
-    return [
+    var sixDay = [
       { name: '推 A', focus: '胸 · 肩 · 三头', slots: ['horizontal_push', 'vertical_push', 'triceps', 'lateral_raise'] },
       { name: '拉 A', focus: '背 · 二头', slots: ['vertical_pull', 'horizontal_pull', 'biceps', 'core'] },
       { name: '腿 A', focus: '下肢', slots: ['squat', 'hinge', 'glute', 'calf'] },
@@ -623,6 +687,12 @@
       { name: '拉 B', focus: '背 · 二头', slots: ['vertical_pull', 'horizontal_pull', 'biceps', 'core'] },
       { name: '腿 B', focus: '下肢', slots: ['lunge', 'hinge', 'glute', 'calf'] }
     ];
+    if (d === 6) return sixDay;
+    /* 7 天：第 7 天固定为低强度恢复日，避免完全没有休息日 */
+    return sixDay.concat([
+      { name: '恢复日（低强度）', focus: '臀 · 核心 · 小腿 · 有氧', recovery: true,
+        slots: ['glute', 'core', 'calf'] }
+    ]);
   }
 
   /* ------------------------------------------------------------------ 动作挑选 */
@@ -720,6 +790,7 @@
     var goal = GOALS[p.goal];
     var split = splitFor(p.daysPerWeek, p.experience);
     var tpl = split[(idx - 1) % split.length];
+    var isRecovery = !!tpl.recovery;
     var cycleOffset = block - 1;
     var setsBase = exp.sets[weekInBlock - 1];
     var bwSetBonus = Math.min(2, Math.floor((block - 1) / 2));
@@ -734,6 +805,7 @@
       });
 
       var sets = setsBase + (ex.weighted ? 0 : bwSetBonus);
+      if (isRecovery) sets = Math.min(sets, 2);
       var reps, rest, isPrimary = false;
       if (p.goal === 'strength') {
         isPrimary = (i === 0 && !ISOLATION[pattern]) || pattern === 'squat' || pattern === 'hinge' || pattern === 'horizontal_push';
@@ -791,7 +863,19 @@
 
     /* 有氧收尾 */
     var finisher = null;
-    if (p.goal === 'fat_loss') {
+    if (isRecovery) {
+      var rcd = pickExercise('cardio', {
+        venue: p.venue, tierCap: Math.min(2, exp.tierCap), excludeJumps: true, offset: cycleOffset
+      });
+      finisher = {
+        id: rcd.id, pattern: 'cardio', patternLabel: '有氧收尾',
+        name: rcd.name, muscle: rcd.muscle, sets: 1, reps: '15–20 分钟（低强度）', repsIsTime: true,
+        restSec: 0, loadText: '自重', loadRaw: 0, loadWeight: 0, loadUnit: null,
+        weighted: false, isJump: !!rcd.isJump,
+        cues: rcd.cues + '（恢复日强度以轻松为准，全程能正常说话，结束后再做 5 分钟拉伸）',
+        notes: [], isPrimary: false
+      };
+    } else if (p.goal === 'fat_loss') {
       if (bClass === 'under') {
         finisher = {
           id: 'cd-stretch', pattern: 'cardio', patternLabel: '恢复',
@@ -823,8 +907,10 @@
     /* 提示 */
     var warnings = [];
     if (p.experience === 'beginner' && p.daysPerWeek >= 5) {
-      warnings.push('新手每周 5–6 天恢复压力较大，建议前期把其中 1–2 天降为轻强度，重点保证动作质量。');
+      warnings.push('新手每周 ' + p.daysPerWeek + ' 天恢复压力较大，建议前期把其中 1–2 天降为轻强度，重点保证动作质量。');
     }
+    if (isRecovery) warnings.push('这是低强度恢复日：组数已压到 2 组，目的是促进恢复，不要练到力竭。');
+    if (p.trainingWeekdays.length >= 7) warnings.push('你选择了每周 7 天，没有完整休息日。第 7 天已自动安排为低强度恢复日；如果疲劳感持续或睡眠变差，建议减到 5–6 天。');
     if (isDeload) warnings.push('本周是第 ' + block + ' 个中周期的减载周，训练量主动降低，恢复优先。');
     if (bClass === 'obese') warnings.push('当前 BMI ' + bmiVal.toFixed(1) + '，计划已自动剔除全部跳跃冲击动作，并优先选用关节友好的替代方案。');
     if (bClass === 'under') warnings.push('当前 BMI ' + bmiVal.toFixed(1) + '，计划侧重力量与增肌，不安排长时间有氧。');
@@ -836,6 +922,8 @@
       bodyClass: bClass, heightClass: hClass, bmi: bmiVal,
       goal: p.goal, goalLabel: goal.label, venue: p.venue, venueLabel: VENUES[p.venue],
       experience: p.experience, experienceLabel: exp.label, daysPerWeek: p.daysPerWeek,
+      trainingWeekdays: p.trainingWeekdays,
+      isRecovery: isRecovery,
       warmup: warmup, exercises: exercises, finisher: finisher,
       cooldown: '训练后全身拉伸 5 分钟，重点拉伸当日训练的肌群，配合缓慢呼吸。',
       warnings: warnings
@@ -845,11 +933,18 @@
   /* ------------------------------------------------------------------ 日历排布 */
   function isTrainingDate(iso, profileRaw) {
     var p = normalizeProfile(profileRaw);
-    return WEEKDAY_PATTERNS[p.daysPerWeek].indexOf(weekdayMon0(iso)) >= 0;
+    return p.trainingWeekdays.indexOf(weekdayMon0(iso)) >= 0;
   }
-  function trainingWeekdays(daysPerWeek) {
-    var d = normalizeProfile({ daysPerWeek: daysPerWeek }).daysPerWeek;
-    return WEEKDAY_PATTERNS[d].slice();
+  /* 传 profile（或含 trainingWeekdays 的对象）返回它自己的训练日；传数字返回对应的推荐预设 */
+  function trainingWeekdays(input) {
+    if (input && typeof input === 'object') return normalizeProfile(input).trainingWeekdays;
+    return presetWeekdays(input);
+  }
+  /* 紧凑写法：周 3 天 → 周一/三/五 */
+  function weekdaySummary(list) {
+    var wd = normalizeWeekdays(list);
+    if (!wd.length) return '未选择';
+    return '周' + wd.map(function (d) { return WEEKDAY_SHORT[d]; }).join('/');
   }
 
   /**
@@ -870,7 +965,7 @@
     var cursor = p.startDate;
     var guard = 0;
     while (diffDays(cursor, end) >= 0 && guard++ < 7300) {
-      var training = WEEKDAY_PATTERNS[p.daysPerWeek].indexOf(weekdayMon0(cursor)) >= 0;
+      var training = p.trainingWeekdays.indexOf(weekdayMon0(cursor)) >= 0;
       var log = logs[cursor] || null;
       var isPast = diffDays(cursor, todayISO) > 0;
       var isToday = !isPast && diffDays(todayISO, cursor) === 0;
@@ -929,10 +1024,11 @@
   var PlanEngine = {
     VERSION: 'v1',
     GOALS: GOALS, EXPERIENCE: EXPERIENCE, VENUES: VENUES,
-    WEEKDAY_PATTERNS: WEEKDAY_PATTERNS, WEEKDAY_CN: WEEKDAY_CN,
+    WEEKDAY_PRESETS: WEEKDAY_PRESETS, WEEKDAY_CN: WEEKDAY_CN, WEEKDAY_SHORT: WEEKDAY_SHORT,
     DB_SIZES: DB_SIZES, EXERCISES: EXERCISES, PATTERN_FALLBACK: PATTERN_FALLBACK,
     pad2: pad2, toISO: toISO, fromISO: fromISO, addDays: addDays, diffDays: diffDays,
     weekdayMon0: weekdayMon0, weekdayName: weekdayName, formatCN: formatCN,
+    normalizeWeekdays: normalizeWeekdays, presetWeekdays: presetWeekdays, weekdaySummary: weekdaySummary,
     bmi: bmi, bodyClassFromBmi: bodyClassFromBmi, bodyClassLabel: bodyClassLabel,
     healthyWeightRange: healthyWeightRange, heightClass: heightClass, heightClassLabel: heightClassLabel,
     normalizeProfile: normalizeProfile, validateProfile: validateProfile,
@@ -967,7 +1063,9 @@
     try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {}
   }
   function loadState() {
-    state.profile = safeGet(KEY_PROFILE);
+    /* 历史档案可能只有 daysPerWeek，读出时立即规范化，保证 trainingWeekdays 一定存在 */
+    var rawProfile = safeGet(KEY_PROFILE);
+    state.profile = rawProfile ? E.normalizeProfile(rawProfile) : null;
     state.progress = safeGet(KEY_PROGRESS) || { logs: {} };
     if (!state.progress.logs) state.progress.logs = {};
   }
@@ -1066,7 +1164,7 @@
     var bc = E.bodyClassFromBmi(b);
     return '<div class="chips">' +
       '<span class="chip">' + E.GOALS[p.goal].label + '</span>' +
-      '<span class="chip">每周 ' + p.daysPerWeek + ' 天</span>' +
+      '<span class="chip">每周 ' + p.daysPerWeek + ' 天 · ' + E.weekdaySummary(p.trainingWeekdays) + '</span>' +
       '<span class="chip">' + E.EXPERIENCE[p.experience].label + '</span>' +
       '<span class="chip n">' + E.VENUES[p.venue] + '</span>' +
       '<span class="chip ' + (bc === 'normal' ? 'g' : 'y') + '">BMI ' + b.toFixed(1) + ' ' + E.bodyClassLabel(bc) + '</span>' +
@@ -1106,7 +1204,7 @@
         '<div class="d3">计划将从这一天开始，每天都有明确安排。</div></div>' +
         '<div class="card"><div class="kv"><span>起始日期</span><b>' + p.startDate + '</b></div>' +
         '<div class="kv"><span>每周训练</span><b>' + p.daysPerWeek + ' 天</b></div>' +
-        '<div class="kv"><span>训练日</span><b>' + E.trainingWeekdays(p.daysPerWeek).map(function (d) { return E.WEEKDAY_CN[d]; }).join('、') + '</b></div></div>';
+        '<div class="kv"><span>训练日</span><b>' + p.trainingWeekdays.map(function (d) { return E.WEEKDAY_CN[d]; }).join('、') + '</b></div></div>';
       return;
     }
 
@@ -1284,10 +1382,17 @@
         '<label class="f"><span>训练目标</span><select id="f-goal">' + Object.keys(E.GOALS).map(function (k) {
           return '<option value="' + k + '"' + (p.goal === k ? ' selected' : '') + '>' + E.GOALS[k].label + '</option>';
         }).join('') + '</select></label>' +
-        '<label class="f"><span>每周可训练天数</span><select id="f-days">' + [2, 3, 4, 5, 6].map(function (n) {
-          return '<option value="' + n + '"' + (p.daysPerWeek === n ? ' selected' : '') + '>' + n + ' 天（' +
-            E.trainingWeekdays(n).map(function (d) { return E.WEEKDAY_CN[d]; }).join(' / ') + '）</option>';
-        }).join('') + '</select></label>' +
+        '<div class="f"><span>每周训练日（已选 <b id="wd-count">' + p.trainingWeekdays.length + '</b> 天）</span>' +
+          '<div class="preset-row" id="wd-presets">' + [1, 2, 3, 4, 5, 6, 7].map(function (n) {
+            return '<button type="button" class="preset" data-preset="' + n + '" title="' +
+              E.trainingWeekdays(n).map(function (d) { return E.WEEKDAY_CN[d]; }).join('、') + '">' + n + ' 天</button>';
+          }).join('') + '</div>' +
+          '<div class="wd-picker" id="wd-picker">' + [0, 1, 2, 3, 4, 5, 6].map(function (i) {
+            return '<button type="button" class="wd-btn" data-wd="' + i + '" aria-pressed="' +
+              (p.trainingWeekdays.indexOf(i) >= 0) + '" title="' + E.WEEKDAY_CN[i] + '">' + E.WEEKDAY_SHORT[i] + '</button>';
+          }).join('') + '</div>' +
+          '<div class="wd-hint" id="wd-hint"></div>' +
+        '</div>' +
         '<label class="f"><span>训练经验</span><select id="f-exp">' +
           '<option value="beginner"' + (p.experience === 'beginner' ? ' selected' : '') + '>新手（6 个月以内）</option>' +
           '<option value="intermediate"' + (p.experience === 'intermediate' ? ' selected' : '') + '>中级（6 个月 – 2 年）</option>' +
@@ -1307,7 +1412,7 @@
         '<div class="kv"><span>BMI</span><b>' + b.toFixed(1) + ' · ' + E.bodyClassLabel(bc) + '</b></div>' +
         '<div class="kv"><span>健康体重区间</span><b>' + range.min + ' – ' + range.max + ' kg</b></div>' +
         '<div class="kv"><span>身高分档</span><b>' + E.heightClassLabel(hc) + '</b></div>' +
-        '<div class="kv"><span>每周训练日</span><b>' + E.trainingWeekdays(p.daysPerWeek).map(function (d) { return E.WEEKDAY_CN[d]; }).join('、') + '</b></div>' +
+        '<div class="kv"><span>每周训练日</span><b>' + E.weekdaySummary(p.trainingWeekdays) + '（' + p.trainingWeekdays.length + ' 天）</b></div>' +
         '<div class="kv"><span>连续打卡</span><b>' + E.computeStreak(state.progress.logs, todayISO()) + ' 天</b></div>' +
         '<div class="kv"><span>累计完成训练</span><b>' + E.completedTrainingDays(state.progress) + ' 次</b></div>' +
         '<div class="cues" style="margin-top:10px">BMI 只用于判断动作冲击量与起始配重，计划同时依据你的目标、经验与场地调整。</div>' +
@@ -1319,12 +1424,56 @@
         '<button class="btn danger block" id="btnReset">' + (hasLogs ? '清除打卡记录' : '清除全部数据') + '</button>' +
       '</div>';
 
+    /* 星期开关：只更新自身 DOM，避免重绘整个表单而清掉用户已填的身高体重 */
+    var draftWd = p.trainingWeekdays.slice();
+    var wdHintEl = document.getElementById('wd-hint');
+    function paintWeekdays(msg) {
+      var count = draftWd.length;
+      document.getElementById('wd-count').textContent = count;
+      Array.prototype.forEach.call(document.querySelectorAll('#wd-picker .wd-btn'), function (b) {
+        b.setAttribute('aria-pressed', draftWd.indexOf(Number(b.dataset.wd)) >= 0 ? 'true' : 'false');
+      });
+      Array.prototype.forEach.call(document.querySelectorAll('#wd-presets .preset'), function (b) {
+        var n = Number(b.dataset.preset);
+        var hit = n === count && E.trainingWeekdays(n).join(',') === draftWd.join(',');
+        b.setAttribute('aria-pressed', hit ? 'true' : 'false');
+      });
+      var warn = false;
+      var text;
+      if (msg) { text = msg; warn = true; }
+      else if (count === 7) { text = '已选 7 天：没有完整休息日，第 7 天会自动安排为低强度恢复日。'; warn = true; }
+      else { text = '已选：' + E.weekdaySummary(draftWd) + '，每周 ' + count + ' 天'; }
+      wdHintEl.textContent = text;
+      wdHintEl.classList.toggle('warn', warn);
+    }
+    document.getElementById('wd-picker').addEventListener('click', function (ev) {
+      var b = ev.target.closest ? ev.target.closest('.wd-btn') : null;
+      if (!b) return;
+      var v = Number(b.dataset.wd);
+      var at = draftWd.indexOf(v);
+      if (at >= 0) {
+        if (draftWd.length === 1) { paintWeekdays('至少要保留 1 个训练日。'); return; }
+        draftWd.splice(at, 1);
+      } else {
+        draftWd.push(v);
+        draftWd.sort(function (a, c) { return a - c; });
+      }
+      paintWeekdays();
+    });
+    document.getElementById('wd-presets').addEventListener('click', function (ev) {
+      var b = ev.target.closest ? ev.target.closest('.preset') : null;
+      if (!b) return;
+      draftWd = E.trainingWeekdays(Number(b.dataset.preset));
+      paintWeekdays();
+    });
+    paintWeekdays();
+
     document.getElementById('btnSave').onclick = function () {
       var next = {
         heightCm: Number(document.getElementById('f-h').value),
         weightKg: Number(document.getElementById('f-w').value),
         goal: document.getElementById('f-goal').value,
-        daysPerWeek: Number(document.getElementById('f-days').value),
+        trainingWeekdays: draftWd.slice(),
         experience: document.getElementById('f-exp').value,
         venue: document.getElementById('f-venue').value,
         startDate: document.getElementById('f-date').value || todayISO()
@@ -1332,16 +1481,17 @@
       var errs = E.validateProfile(next);
       if (errs.length) { alert(errs.join('\n')); return; }
       var prev = state.profile;
-      var structChanged = !prev || prev.daysPerWeek !== next.daysPerWeek || prev.startDate !== next.startDate;
+      var prevWd = prev ? E.trainingWeekdays(prev).join(',') : '';
+      var structChanged = !prev || prevWd !== next.trainingWeekdays.join(',') || prev.startDate !== next.startDate;
       if (structChanged && hasLogs) {
-        if (!confirm('修改了每周训练天数或起始日期，已有的打卡记录将不再对应新计划，是否重置打卡记录？\n（点击“取消”则保留记录，但计划日期会重新计算）')) {
+        if (!confirm('修改了每周训练日或起始日期，已有的打卡记录将不再对应新计划，是否重置打卡记录？\n（点击“取消”则保留记录，但计划日期会重新计算）')) {
           /* 保留记录 */
         } else {
           state.progress = { logs: {} };
           saveProgress();
         }
       }
-      state.profile = next;
+      state.profile = E.normalizeProfile(next);
       saveProfile();
       state.tab = 'today';
       syncTabs();
