@@ -75,6 +75,113 @@ for (const d of [2, 3, 4, 5, 6]) {
   ok('30 天训练日数量合理（17 或 18）', trainCount === 17 || trainCount === 18, String(trainCount));
 }
 
+/* ------------------------------------------------------------------ 2b. 自定义训练周几 */
+{
+  /* 旧档案迁移：只有 daysPerWeek 时按预设还原 */
+  const legacy = E.normalizeProfile({ daysPerWeek: 3 });
+  ok('旧档案迁移出训练日数组', JSON.stringify(legacy.trainingWeekdays) === JSON.stringify([0, 2, 4]),
+    JSON.stringify(legacy.trainingWeekdays));
+  eq('旧档案迁移后天数一致', legacy.daysPerWeek, 3);
+  const legacy5 = E.normalizeProfile({ daysPerWeek: 5 });
+  ok('旧档案 5 天迁移正确', JSON.stringify(legacy5.trainingWeekdays) === JSON.stringify([0, 1, 2, 4, 5]),
+    JSON.stringify(legacy5.trainingWeekdays));
+
+  /* 天数由数组长度派生 */
+  const custom = E.normalizeProfile({ trainingWeekdays: [1, 3, 5] });
+  eq('天数由数组长度派生', custom.daysPerWeek, 3);
+  ok('自定义星期被保留', JSON.stringify(custom.trainingWeekdays) === JSON.stringify([1, 3, 5]),
+    JSON.stringify(custom.trainingWeekdays));
+
+  /* 脏数据过滤 */
+  const dirty = E.normalizeProfile({ trainingWeekdays: [6, 0, 0, 9, -1, 2, 2, '1'] });
+  ok('脏数据被过滤、去重、升序', JSON.stringify(dirty.trainingWeekdays) === JSON.stringify([0, 1, 2, 6]),
+    JSON.stringify(dirty.trainingWeekdays));
+  const empt = E.normalizeProfile({ trainingWeekdays: [], daysPerWeek: 4 });
+  ok('空数组回落到预设', JSON.stringify(empt.trainingWeekdays) === JSON.stringify([0, 1, 3, 4]),
+    JSON.stringify(empt.trainingWeekdays));
+  const allBad = E.normalizeProfile({ trainingWeekdays: ['x', 99, -3] });
+  ok('全部非法时回落到默认 3 天', JSON.stringify(allBad.trainingWeekdays) === JSON.stringify([0, 2, 4]),
+    JSON.stringify(allBad.trainingWeekdays));
+
+  /* 预设覆盖 1–7 天 */
+  for (const n of [1, 2, 3, 4, 5, 6, 7]) {
+    const preset = E.trainingWeekdays(n);
+    eq(`预设 ${n} 天长度`, preset.length, n);
+    ok(`预设 ${n} 天升序且在 0–6 内`, preset.every((v, i) => v >= 0 && v <= 6 && (i === 0 || v > preset[i - 1])),
+      JSON.stringify(preset));
+  }
+  ok('1 天预设是周三', E.trainingWeekdays(1).join(',') === '2', JSON.stringify(E.trainingWeekdays(1)));
+  ok('7 天预设是周一至周日', E.trainingWeekdays(7).join(',') === '0,1,2,3,4,5,6', JSON.stringify(E.trainingWeekdays(7)));
+  ok('传 profile 返回它自己的训练日',
+    E.trainingWeekdays({ trainingWeekdays: [5, 1] }).join(',') === '1,5');
+
+  /* 时间轴严格按自定义星期排期 */
+  {
+    const prof = { heightCm: 175, weightKg: 80, goal: 'recomp', trainingWeekdays: [1, 3, 5], experience: 'beginner', venue: 'gym', startDate: '2026-01-05' };
+    const tl = E.buildTimeline(prof, { logs: {} }, '2026-01-05', '2026-01-11', '2026-01-05');
+    const training = Object.values(tl).filter(d => d.training).map(d => d.date);
+    ok('自定义周二/四/六只在这三天排训练',
+      JSON.stringify(training) === JSON.stringify(['2026-01-06', '2026-01-08', '2026-01-10']),
+      JSON.stringify(training));
+    eq('自定义排期下训练日数量', training.length, 3);
+    eq('自定义排期下周一为休息日', tl['2026-01-05'].training, false);
+    eq('自定义排期下周二为第 1 天', tl['2026-01-06'].sessionIndex, 1);
+    eq('自定义排期下周四为第 2 天', tl['2026-01-08'].sessionIndex, 2);
+    eq('自定义排期下周六为第 3 天', tl['2026-01-10'].sessionIndex, 3);
+    eq('isTrainingDate 跟随自定义星期', E.isTrainingDate('2026-01-07', prof), false);
+    eq('isTrainingDate 命中自定义星期', E.isTrainingDate('2026-01-08', prof), true);
+
+    /* 顺延在自定义星期下同样成立 */
+    const logs = { '2026-01-06': { status: 'done' } };
+    const tl2 = E.buildTimeline(prof, { logs }, '2026-01-10', '2026-01-10');
+    eq('自定义星期下漏练仍顺延', tl2['2026-01-10'].sessionIndex, 2);
+    eq('自定义星期下连击计算正确', E.computeStreak(logs, '2026-01-06'), 1);
+    eq('自定义星期下断签归零', E.computeStreak(logs, '2026-01-08'), 0);
+  }
+
+  /* 单周只练 1 天 */
+  {
+    const prof = { heightCm: 170, weightKg: 68, goal: 'recomp', trainingWeekdays: [6], experience: 'beginner', venue: 'home_bodyweight', startDate: '2026-01-05' };
+    eq('1 天档案天数', E.normalizeProfile(prof).daysPerWeek, 1);
+    const tl = E.buildTimeline(prof, { logs: {} }, '2026-01-05', '2026-01-18', '2026-01-05');
+    const training = Object.values(tl).filter(d => d.training).map(d => d.date);
+    ok('每周只排周日', training.every(d => E.weekdayMon0(d) === 6), JSON.stringify(training));
+    eq('两周共 2 次训练', training.length, 2);
+    const s = E.sessionFor(prof, 2);
+    eq('每周 1 天时第 2 次属第 2 周', s.week, 2);
+    ok('1 天分化只有一个模板', E.splitFor(1, 'advanced').length === 1);
+    ok('1 天训练内容完整', s.exercises.length >= 5, String(s.exercises.length));
+  }
+
+  /* 每周 7 天：第 7 天是低强度恢复日 */
+  {
+    const prof = { heightCm: 175, weightKg: 75, goal: 'muscle_gain', trainingWeekdays: [0, 1, 2, 3, 4, 5, 6], experience: 'advanced', venue: 'gym', startDate: '2026-01-05' };
+    const split = E.splitFor(7, 'advanced');
+    eq('7 天共 7 个分化', split.length, 7);
+    eq('第 7 个分化是恢复日', split[6].recovery, true);
+    const rec = E.sessionFor(prof, 7);
+    eq('第 7 天标记为恢复日', rec.isRecovery, true);
+    ok('恢复日标题含“恢复”', rec.title.includes('恢复'), rec.title);
+    ok('恢复日所有动作不超过 2 组', rec.exercises.every(e => e.sets <= 2),
+      rec.exercises.map(e => e.name + ':' + e.sets).join(','));
+    ok('恢复日必有低强度有氧收尾', !!rec.finisher && rec.finisher.isJump === false, JSON.stringify(rec.finisher && rec.finisher.name));
+    ok('恢复日给出无完整休息日的提示', rec.warnings.join('').includes('没有完整休息日'), rec.warnings.join(' | '));
+    const day1 = E.sessionFor(prof, 1);
+    eq('第 1 天不是恢复日', day1.isRecovery, false);
+    eq('7 天时第 7 天仍属第 1 周', rec.week, 1);
+    eq('7 天时第 8 天属第 2 周', E.sessionFor(prof, 8).week, 2);
+    /* 恢复日的组数不受经验等级影响 */
+    const recBeg = E.sessionFor({ ...prof, experience: 'beginner' }, 7);
+    ok('新手恢复日同样压到 2 组', recBeg.exercises.every(e => e.sets <= 2));
+  }
+
+  /* 校验：至少 1 天 */
+  ok('空训练日集合报错', E.validateProfile({ heightCm: 170, weightKg: 70, trainingWeekdays: [] }).length > 0);
+  ok('合法训练日集合通过', E.validateProfile({ heightCm: 170, weightKg: 70, trainingWeekdays: [0, 2] }).length === 0);
+  ok('越界训练日被过滤后仍有 1 天即可通过',
+    E.validateProfile({ heightCm: 170, weightKg: 70, trainingWeekdays: [9, 3] }).length === 0);
+}
+
 /* ------------------------------------------------------------------ 3. 中周期递进与减载 */
 {
   const prof = { heightCm: 175, weightKg: 80, goal: 'muscle_gain', daysPerWeek: 3, experience: 'intermediate', venue: 'gym', startDate: '2026-01-05' };
@@ -116,7 +223,7 @@ for (const d of [2, 3, 4, 5, 6]) {
   for (const venue of ['home_bodyweight', 'home_dumbbell', 'gym'])
     for (const goal of ['fat_loss', 'muscle_gain', 'recomp', 'strength'])
       for (const ex of ['beginner', 'intermediate', 'advanced'])
-        for (const d of [2, 3, 4, 5, 6])
+        for (const d of [1, 2, 3, 4, 5, 6, 7])
           profileMatrix.push({ heightCm: 172, weightKg: 78, goal, daysPerWeek: d, experience: ex, venue, startDate: '2026-01-05' });
 
   let generated = 0, empty = 0;
@@ -128,7 +235,7 @@ for (const d of [2, 3, 4, 5, 6]) {
     }
   }
   eq('组合矩阵下 400 天全部生成动作', empty, 0);
-  eq('组合矩阵规模 = 180 组 × 400 天', generated, 180 * 400);
+  eq('组合矩阵规模 = 252 组 × 400 天', generated, 252 * 400);
 
   // 单组合 400 天细查
   const prof = { heightCm: 172, weightKg: 78, goal: 'recomp', daysPerWeek: 4, experience: 'intermediate', venue: 'home_dumbbell', startDate: '2026-01-05' };
@@ -148,7 +255,7 @@ for (const d of [2, 3, 4, 5, 6]) {
   for (const venue of ['home_bodyweight', 'home_dumbbell', 'gym'])
     for (const goal of ['fat_loss', 'muscle_gain', 'recomp', 'strength'])
       for (const ex of ['beginner', 'intermediate', 'advanced'])
-        for (const d of [2, 3, 4, 5, 6]) {
+        for (const d of [1, 2, 3, 4, 5, 6, 7]) {
           const prof = { heightCm: 170, weightKg: 95, goal, daysPerWeek: d, experience: ex, venue, startDate: '2026-01-05' };
           ok(`肥胖档判定（170/95）`, E.bodyClassFromBmi(E.bmi(170, 95)) === 'obese');
           for (let i = 1; i <= 60; i++) {
