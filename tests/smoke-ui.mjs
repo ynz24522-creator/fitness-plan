@@ -1,5 +1,5 @@
 /**
- * 界面冒烟测试：用最小 DOM 桩真正执行 <script id="app-ui">，
+ * 界面冒烟测试：用最小 DOM 桩真正执行 app.js，
  * 逐个页签渲染并模拟打卡，确认没有运行时错误、关键内容缺失。
  * 运行： node tests/smoke-ui.mjs
  */
@@ -8,10 +8,11 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const html = readFileSync(join(here, '..', 'index.html'), 'utf8');
-
-const engineCode = html.match(/<script id="plan-engine">([\s\S]*?)<\/script>/)[1];
-const uiCode = html.match(/<script id="app-ui">([\s\S]*?)<\/script>/)[1];
+const dir = join(here, '..');
+const html = readFileSync(join(dir, 'index.html'), 'utf8');
+const engineCode = readFileSync(join(dir, 'plan-engine.js'), 'utf8');
+const dietCode = readFileSync(join(dir, 'diet-engine.js'), 'utf8');
+const uiCode = readFileSync(join(dir, 'app.js'), 'utf8');
 
 /* 固定“今天”为 2026-09-11（周五），让断言不随运行日期变化。
    周五在“每周 3 天（周一/三/五）”里是训练日，在“每周 2 天（周一/四）”里是休息日，
@@ -34,6 +35,67 @@ const eq = (name, actual, expected) => ok(name, actual === expected, `期望 ${e
 
 /* ------------------------- DOM 桩 ------------------------- */
 const store = new Map();
+/* 从 innerHTML 里解析出带 data-* 的按钮桩，并按宿主元素 + 版本号缓存 */
+const btnCache = new WeakMap();
+function childButtons(hostEl, attr) {
+  if (!hostEl) return [];
+  let entry = btnCache.get(hostEl);
+  if (!entry || entry.ver !== hostEl._htmlVersion) { entry = { ver: hostEl._htmlVersion, map: {} }; btnCache.set(hostEl, entry); }
+  if (entry.map[attr]) return entry.map[attr];
+  const html = hostEl.innerHTML || '';
+  const out = [];
+  const re = new RegExp('<button[^>]*\\s' + attr + '="([^"]+)"[^>]*>', 'g');
+  let m;
+  while ((m = re.exec(html))) {
+    const tag = m[0], val = m[1];
+    const b = makeEl(attr + '-' + val + '-' + out.length);
+    b.dataset[attr.replace('data-', '')] = val;
+    b.setAttribute(attr, val);
+    const ap = /aria-pressed="([^"]*)"/.exec(tag);
+    b.setAttribute('aria-pressed', ap ? ap[1] : 'false');
+    out.push(b);
+  }
+  entry.map[attr] = out;
+  return out;
+}
+function childById(hostEl, id) {
+  const entry = (btnCache.get(hostEl) && btnCache.get(hostEl).ver === hostEl._htmlVersion) ? btnCache.get(hostEl) : null;
+  if (!entry) childButtons(hostEl, 'data-nope');
+  const e2 = btnCache.get(hostEl);
+  e2.ids = e2.ids || {};
+  if (!e2.ids[id]) e2.ids[id] = makeEl(id);
+  return e2.ids[id];
+}
+const fbCache = new WeakMap();
+function fbOptionButtons(hostEl, key) {
+  if (!hostEl) return [];
+  let entry = fbCache.get(hostEl);
+  if (!entry || entry.ver !== hostEl._htmlVersion) { entry = { ver: hostEl._htmlVersion, map: {} }; fbCache.set(hostEl, entry); }
+  if (entry.map[key]) return entry.map[key];
+  const html = (hostEl && hostEl.innerHTML) || '';
+  const idx = html.indexOf('data-fb="' + key + '"');
+  const out = [];
+  if (idx >= 0) {
+    const body = html.slice(idx, html.indexOf('</div>', idx));
+    const re = /<button[^>]*class="opt"[^>]*>/g;
+    let m;
+    while ((m = re.exec(body))) {
+      const tag = m[0];
+      const b = makeEl('fbopt-' + key + '-' + out.length);
+      const dv = /data-val="([^"]*)"/.exec(tag);
+      const dp = /data-pain="([^"]*)"/.exec(tag);
+      if (dv) { b.dataset.val = dv[1]; b.setAttribute('data-val', dv[1]); }
+      if (dp) { b.dataset.pain = dp[1]; b.setAttribute('data-pain', dp[1]); }
+      const ap = /aria-pressed="([^"]*)"/.exec(tag);
+      b.setAttribute('aria-pressed', ap ? ap[1] : 'false');
+      b.parentNode = { getAttribute: (k) => (k === 'data-fb' ? key : null) };
+      out.push(b);
+    }
+  }
+  entry.map[key] = out;
+  return out;
+}
+
 function makeEl(id) {
   const el = {
     id, hidden: false, value: '', style: {},
@@ -47,7 +109,24 @@ function makeEl(id) {
     },
     addEventListener(type, fn) { this.listeners[type] = fn; },
     setAttribute(k, v) { this.attrs[k] = String(v); },
-    getAttribute(k) { return this.attrs[k] === undefined ? null : this.attrs[k]; }
+    getAttribute(k) { return this.attrs[k] === undefined ? null : this.attrs[k]; },
+    querySelector(sel) {
+      if (sel.charAt(0) === '#') return childById(this, sel.slice(1));
+      if (sel.indexOf('data-fb=') >= 0) {
+        const key = /data-fb="([^"]+)"/.exec(sel)[1];
+        return fbOptionButtons(this, key)[0] || null;
+      }
+      if (sel === '[data-fjoint]') return childButtons(this, 'data-fjoint')[0] || null;
+      return null;
+    },
+    querySelectorAll(sel) {
+      if (sel === '[data-fjoint]') return childButtons(this, 'data-fjoint');
+      if (sel.indexOf('data-fb=') >= 0) {
+        const key = /data-fb="([^"]+)"/.exec(sel)[1];
+        return fbOptionButtons(this, key);
+      }
+      return [];
+    }
   };
   let html = '';
   let text = '';
@@ -68,31 +147,11 @@ const getEl = (id) => {
   return els.get(id);
 };
 
-const tabButtons = ['today', 'plan', 'me'].map((t) => { const e = makeEl('tab-' + t); e.dataset.tab = t; return e; });
+const tabButtons = ['today', 'plan', 'diet', 'me'].map((t) => { const e = makeEl('tab-' + t); e.dataset.tab = t; return e; });
 
-/* 星期开关与预设按钮是写在 innerHTML 字符串里的，这里按渲染结果解析出可点击的桩元素 */
-let pickerCache = { ver: -1, wd: [], pr: [] };
 function picker() {
   const me = els.get('view-me');
-  const ver = me ? me._htmlVersion : 0;
-  if (pickerCache.ver === ver) return pickerCache;
-  const html = me ? me.innerHTML : '';
-  const wd = [], pr = [];
-  const grab = (re, key, list, make) => {
-    let m;
-    while ((m = re.exec(html))) {
-      const tag = m[0];
-      const b = makeEl(make + '-' + m[1]);
-      b.dataset[key] = m[1];
-      const ap = /aria-pressed="([^"]*)"/.exec(tag);
-      if (ap) b.setAttribute('aria-pressed', ap[1]);
-      list.push(b);
-    }
-  };
-  grab(/<button[^>]*data-wd="(\d)"[^>]*>/g, 'wd', wd, 'wdbtn');
-  grab(/<button[^>]*data-preset="(\d)"[^>]*>/g, 'preset', pr, 'preset');
-  pickerCache = { ver, wd, pr };
-  return pickerCache;
+  return { wd: childButtons(me, 'data-wd'), pr: childButtons(me, 'data-preset') };
 }
 function clickWeekday(i) {
   const btn = picker().wd.find((b) => Number(b.dataset.wd) === i);
@@ -113,10 +172,25 @@ const documentStub = {
     if (sel === 'nav.tabs button') return tabButtons;
     if (sel === '#wd-picker .wd-btn') return picker().wd;
     if (sel === '#wd-presets .preset') return picker().pr;
+    const me = els.get('view-me');
+    if (sel === '#diet-pattern .preset') return childButtons(me, 'data-diet');
+    if (sel === '#diet-meals .preset') return childButtons(me, 'data-meals');
+    if (sel === '#view-me [data-injury]') return childButtons(me, 'data-injury');
+    if (sel === 'svg[data-anim]') return [];
     return [];
   },
-  addEventListener() {}
+  addEventListener(type, fn) { docListeners[type] = fn; }
 };
+const docListeners = {};
+/* 模拟一次委托点击：data-xxx=value */
+function dispatch(attr, value) {
+  const t = makeEl(attr + ':' + value);
+  t.dataset[attr] = value;
+  t.setAttribute('data-' + attr, value);
+  const closest = (sel) => (sel.indexOf('[data-' + attr + ']') >= 0 ? t : null);
+  docListeners.click({ target: { closest } });
+  return t;
+}
 const localStorageStub = {
   getItem: (k) => (store.has(k) ? store.get(k) : null),
   setItem: (k, v) => store.set(k, String(v)),
@@ -132,6 +206,7 @@ globalThis.window = { scrollTo() {} };
 
 /* ------------------------- 执行引擎与界面 ------------------------- */
 new Function(engineCode)();
+new Function(dietCode)();
 const E = globalThis.PlanEngine;
 ok('引擎已挂载', !!E);
 
@@ -184,8 +259,24 @@ ok('组间休息按钮存在', todayHtml.includes('开始休息'));
 /* 模拟打卡 */
 ok('btnDone 已绑定', typeof getEl('btnDone').onclick === 'function');
 getEl('btnDone').onclick();
+/* 现在打卡会先弹出反馈表单 */
+const modalHost = getEl('modalHost');
+ok('打卡弹出反馈表单', modalHost.innerHTML.includes('完成度') && modalHost.innerHTML.includes('主观强度'));
+ok('反馈表单含疼痛与疲劳选项', modalHost.innerHTML.includes('训练中有疼痛吗') && modalHost.innerHTML.includes('疲劳与睡眠'));
+ok('反馈表单有跳过入口', modalHost.innerHTML.includes('跳过反馈，直接打卡'));
+ok('反馈提交按钮已绑定', typeof modalHost.querySelector('#fbSubmit').onclick === 'function');
+eq('反馈默认完成度为全部完成', modalHost.querySelector('#fbSubmit') && true, true);
+/* 选“太难”并提交 */
+const rpeOpts = modalHost.querySelectorAll('[data-fb="rpe"] .opt');
+eq('强度选项共 4 个', rpeOpts.length, 4);
+modalHost.listeners.click({ target: rpeOpts[3] });
+eq('选中“太难”后状态更新', rpeOpts[3].getAttribute('aria-pressed'), 'true');
+modalHost.querySelector('#fbSubmit').onclick();
 const saved = JSON.parse(store.get('fitnessPlan.v1.progress'));
 ok('打卡已写入 localStorage', saved.logs[startDate] && saved.logs[startDate].status === 'done');
+ok('反馈已写入 localStorage', saved.feedback && saved.feedback[startDate] && saved.feedback[startDate].rpe === 9.5,
+  JSON.stringify(saved.feedback));
+ok('反馈写入后弹层关闭', modalHost.hidden === true);
 ok('打卡后今日页显示已完成', getEl('view-today').innerHTML.includes('今日训练已完成'));
 ok('连击天数显示为 1', getEl('view-today').innerHTML.includes('连续打卡 1 天'));
 
@@ -240,6 +331,8 @@ ok('未来起始日计划页显示未开始', futurePlan.includes('计划开始�
 bootFresh(null);
 getEl('f-h').value = '168';
 getEl('f-w').value = '62';
+getEl('f-age').value = '30';
+getEl('f-sex').value = 'male';
 getEl('f-goal').value = 'muscle_gain';
 clickPreset(4);
 getEl('f-exp').value = 'intermediate';
@@ -268,6 +361,8 @@ ok('非法输入不会写入资料', store.get('fitnessPlan.v1.profile') == null
 bootFresh(null);
 getEl('f-h').value = '176';
 getEl('f-w').value = '72';
+getEl('f-age').value = '28';
+getEl('f-sex').value = 'male';
 ok('默认渲染三个星期开关为选中', JSON.stringify(pressedWeekdays()) === JSON.stringify([0, 2, 4]),
   JSON.stringify(pressedWeekdays()));
 eq('默认计数显示 3 天', getEl('wd-count').textContent, '3');
@@ -316,6 +411,57 @@ const around = (needle, len) => { const i = planCustom.indexOf(needle); return i
 ok('计划页把周六（09-12）标为训练日', around('09-12', 400).includes('训练'), around('09-12', 400).slice(0, 160));
 ok('计划页把周日（09-13）标为休息', around('09-13', 400).includes('休息'), around('09-13', 400).slice(0, 160));
 ok('计划页把周五（09-11）标为已打卡/休息', /休息|已打卡/.test(around('09-11', 400)), around('09-11', 400).slice(0, 160));
+
+/* 场景 9：动作示意弹层 */
+bootFresh({ heightCm: 178, weightKg: 80, age: 30, sex: 'male', goal: 'muscle_gain', trainingWeekdays: [0, 2, 4], experience: 'intermediate', venue: 'gym', startDate: startDate });
+let todaySvg = gotoTab('today');
+const curSession = (function () {
+  const p = E.normalizeProfile(JSON.parse(store.get('fitnessPlan.v1.profile')));
+  return E.sessionFor(p, 1);
+})();
+ok('动作卡片内有示意动画标记', todaySvg.includes('data-anim="'), '');
+ok('权重动作带配重标记', todaySvg.includes('data-weighted="1"') || todaySvg.includes('data-weighted="0"'));
+dispatch('demo', curSession.exercises[0].id);
+const mh = getEl('modalHost');
+ok('点击动作弹出放大示意', mh.hidden === false && mh.innerHTML.includes('modal-anim'), mh.innerHTML.slice(0, 80));
+ok('弹层内含动作名称', mh.innerHTML.includes(curSession.exercises[0].name));
+ok('弹层内含真人示范链接', mh.innerHTML.includes('search.bilibili.com') && mh.innerHTML.includes('看真人示范'));
+ok('弹层链接指向 B 站搜索且新开标签', mh.innerHTML.includes('target="_blank"') && mh.innerHTML.includes('rel="noopener noreferrer"'));
+dispatch('close', '1');
+ok('关闭后弹层清空', mh.hidden === true && mh.innerHTML === '');
+
+/* 场景 10：伤病开关影响今日安排 */
+const permProf = { heightCm: 178, weightKg: 80, age: 30, sex: 'male', goal: 'muscle_gain', trainingWeekdays: [0, 2, 4], experience: 'intermediate', venue: 'gym', injuries: ['lower_back'], startDate: startDate };
+bootFresh(permProf);
+const injHtml = gotoTab('today');
+ok('今日页显示常驻受限部位', injHtml.includes('正在规避：腰'), '');
+ok('伤病提示出现在今日页', injHtml.includes('受限部位') || injHtml.includes('跳过'));
+/* 临时加一个受限部位 */
+bootFresh({ ...permProf, injuries: [] });
+gotoTab('today');
+dispatch('joint', 'knee');
+const afterJoint = getEl('view-today').innerHTML;
+ok('临时伤病生效并显示规避提示', afterJoint.includes('正在规避：膝'), afterJoint.slice(0, 200));
+ok('临时伤病写入 progress', JSON.parse(store.get('fitnessPlan.v1.progress')).tempJoints[isoToday].indexOf('knee') >= 0);
+
+/* 场景 11：饮食页 */
+bootFresh({ heightCm: 178, weightKg: 92, age: 32, sex: 'male', goal: 'fat_loss', trainingWeekdays: [0, 2, 4], experience: 'intermediate', venue: 'gym', startDate: startDate });
+const dietHtml = gotoTab('diet');
+ok('饮食页显示每日热量目标', /kcal/.test(dietHtml) && dietHtml.includes('基础代谢'));
+ok('饮食页显示三大营养素', dietHtml.includes('蛋白') && dietHtml.includes('碳水') && dietHtml.includes('脂肪'));
+ok('饮食页显示三餐', dietHtml.includes('早餐') && dietHtml.includes('午餐') && dietHtml.includes('晚餐'));
+ok('饮食页有换一套按钮', typeof getEl('btnShuffle').onclick === 'function');
+const firstDiet = dietHtml;
+getEl('btnShuffle').onclick();
+ok('换一套后组合变化', getEl('view-diet').innerHTML !== firstDiet);
+ok('换一套后仍显示热量', getEl('view-diet').innerHTML.includes('kcal'));
+ok('饮食页带免责声明', getEl('view-diet').innerHTML.includes('不构成医疗或营养处方'));
+
+/* 场景 12：无档案时饮食页引导 */
+bootFresh(null);
+gotoTab('diet');
+ok('无档案时饮食页给出引导', getEl('view-diet').innerHTML.includes('还没有饮食方案'));
+ok('饮食页有去填写资料的入口', getEl('view-diet').innerHTML.includes('data-goto="me"'));
 
 console.log(`\n通过 ${pass} 项${failures.length ? `，失败 ${failures.length} 项` : '，全部通过 ✅'}`);
 if (failures.length) {
