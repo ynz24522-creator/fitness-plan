@@ -35,9 +35,9 @@ const eq = (name, actual, expected) => ok(name, actual === expected, `期望 ${e
 /* ------------------------- DOM 桩 ------------------------- */
 const store = new Map();
 function makeEl(id) {
-  return {
-    id, innerHTML: '', textContent: '', hidden: false, value: '', style: {},
-    dataset: {}, onclick: null, listeners: {},
+  const el = {
+    id, hidden: false, value: '', style: {},
+    dataset: {}, onclick: null, listeners: {}, attrs: {}, _htmlVersion: 0,
     classList: {
       _s: new Set(),
       add(c) { this._s.add(c); },
@@ -45,8 +45,22 @@ function makeEl(id) {
       toggle(c, v) { if (v === undefined) { this._s.has(c) ? this._s.delete(c) : this._s.add(c); } else if (v) this._s.add(c); else this._s.delete(c); },
       contains(c) { return this._s.has(c); }
     },
-    addEventListener(type, fn) { this.listeners[type] = fn; }
+    addEventListener(type, fn) { this.listeners[type] = fn; },
+    setAttribute(k, v) { this.attrs[k] = String(v); },
+    getAttribute(k) { return this.attrs[k] === undefined ? null : this.attrs[k]; }
   };
+  let html = '';
+  let text = '';
+  /* 真实 DOM 里 textContent 赋值会被转成字符串，桩也照做 */
+  Object.defineProperty(el, 'textContent', {
+    get() { return text; },
+    set(v) { text = v === null || v === undefined ? '' : String(v); }
+  });
+  Object.defineProperty(el, 'innerHTML', {
+    get() { return html; },
+    set(v) { html = String(v); el._htmlVersion++; }
+  });
+  return el;
 }
 const els = new Map();
 const getEl = (id) => {
@@ -56,10 +70,49 @@ const getEl = (id) => {
 
 const tabButtons = ['today', 'plan', 'me'].map((t) => { const e = makeEl('tab-' + t); e.dataset.tab = t; return e; });
 
+/* 星期开关与预设按钮是写在 innerHTML 字符串里的，这里按渲染结果解析出可点击的桩元素 */
+let pickerCache = { ver: -1, wd: [], pr: [] };
+function picker() {
+  const me = els.get('view-me');
+  const ver = me ? me._htmlVersion : 0;
+  if (pickerCache.ver === ver) return pickerCache;
+  const html = me ? me.innerHTML : '';
+  const wd = [], pr = [];
+  const grab = (re, key, list, make) => {
+    let m;
+    while ((m = re.exec(html))) {
+      const tag = m[0];
+      const b = makeEl(make + '-' + m[1]);
+      b.dataset[key] = m[1];
+      const ap = /aria-pressed="([^"]*)"/.exec(tag);
+      if (ap) b.setAttribute('aria-pressed', ap[1]);
+      list.push(b);
+    }
+  };
+  grab(/<button[^>]*data-wd="(\d)"[^>]*>/g, 'wd', wd, 'wdbtn');
+  grab(/<button[^>]*data-preset="(\d)"[^>]*>/g, 'preset', pr, 'preset');
+  pickerCache = { ver, wd, pr };
+  return pickerCache;
+}
+function clickWeekday(i) {
+  const btn = picker().wd.find((b) => Number(b.dataset.wd) === i);
+  els.get('wd-picker').listeners.click({ target: { closest: (s) => (s === '.wd-btn' ? btn : null) } });
+}
+function clickPreset(n) {
+  const btn = picker().pr.find((b) => Number(b.dataset.preset) === n);
+  els.get('wd-presets').listeners.click({ target: { closest: (s) => (s === '.preset' ? btn : null) } });
+}
+function pressedWeekdays() {
+  return picker().wd.filter((b) => b.getAttribute('aria-pressed') === 'true')
+    .map((b) => Number(b.dataset.wd)).sort((a, b) => a - b);
+}
+
 const documentStub = {
   getElementById: getEl,
   querySelectorAll(sel) {
     if (sel === 'nav.tabs button') return tabButtons;
+    if (sel === '#wd-picker .wd-btn') return picker().wd;
+    if (sel === '#wd-presets .preset') return picker().pr;
     return [];
   },
   addEventListener() {}
@@ -188,13 +241,17 @@ bootFresh(null);
 getEl('f-h').value = '168';
 getEl('f-w').value = '62';
 getEl('f-goal').value = 'muscle_gain';
-getEl('f-days').value = '4';
+clickPreset(4);
 getEl('f-exp').value = 'intermediate';
 getEl('f-venue').value = 'home_dumbbell';
 getEl('f-date').value = isoToday;
 getEl('btnSave').onclick();
 const savedProfile = JSON.parse(store.get('fitnessPlan.v1.profile'));
-ok('保存资料写入 localStorage', savedProfile.heightCm === 168 && savedProfile.daysPerWeek === 4 && savedProfile.venue === 'home_dumbbell');
+ok('保存资料写入 localStorage',
+  savedProfile.heightCm === 168 && savedProfile.venue === 'home_dumbbell' &&
+  JSON.stringify(savedProfile.trainingWeekdays) === JSON.stringify([0, 1, 3, 4]),
+  JSON.stringify(savedProfile));
+eq('保存后天数由训练日推导', E.normalizeProfile(savedProfile).daysPerWeek, 4);
 ok('保存后自动跳到今日页', tabButtons.find((b) => b.dataset.tab === 'today').classList.contains('active'));
 ok('保存后今日页有内容', getEl('view-today').innerHTML.length > 200);
 
@@ -206,6 +263,59 @@ alerts.length = 0;
 getEl('btnSave').onclick();
 ok('非法身高被拦截并提示', alerts.length === 1 && alerts[0].includes('身高'), alerts.join('|'));
 ok('非法输入不会写入资料', store.get('fitnessPlan.v1.profile') == null);
+
+/* 场景 8：自定义训练日选择器 */
+bootFresh(null);
+getEl('f-h').value = '176';
+getEl('f-w').value = '72';
+ok('默认渲染三个星期开关为选中', JSON.stringify(pressedWeekdays()) === JSON.stringify([0, 2, 4]),
+  JSON.stringify(pressedWeekdays()));
+eq('默认计数显示 3 天', getEl('wd-count').textContent, '3');
+ok('默认提示列出周一/三/五', getEl('wd-hint').textContent.includes('周一/三/五'), getEl('wd-hint').textContent);
+
+/* 取消一个训练日 */
+clickWeekday(2);
+eq('取消周三后剩 2 天', getEl('wd-count').textContent, '2');
+ok('提示同步为周一/五', getEl('wd-hint').textContent.includes('周一/五'), getEl('wd-hint').textContent);
+eq('切换星期不会清空已填身高', getEl('f-h').value, '176');
+eq('切换星期不会清空已填体重', getEl('f-w').value, '72');
+
+/* 快捷预设 */
+clickPreset(5);
+eq('预设 5 天后计数', getEl('wd-count').textContent, '5');
+ok('预设 5 天选中的星期正确', JSON.stringify(pressedWeekdays()) === JSON.stringify(E.trainingWeekdays(5)),
+  JSON.stringify(pressedWeekdays()));
+clickPreset(1);
+eq('预设 1 天后计数', getEl('wd-count').textContent, '1');
+ok('1 天预设是周三', JSON.stringify(pressedWeekdays()) === JSON.stringify([2]), JSON.stringify(pressedWeekdays()));
+clickWeekday(2);
+eq('只剩 1 天时无法取消', getEl('wd-count').textContent, '1');
+ok('给出至少保留 1 天的提示', getEl('wd-hint').textContent.includes('至少'), getEl('wd-hint').textContent);
+
+/* 全选 7 天给出无休息日提示 */
+clickPreset(7);
+eq('全选 7 天', getEl('wd-count').textContent, '7');
+ok('7 天提示没有完整休息日', getEl('wd-hint').textContent.includes('没有完整休息日'), getEl('wd-hint').textContent);
+
+/* 自由组合：周一/周四 + 周六 */
+clickPreset(2);
+clickWeekday(5);
+eq('自定义组合为 3 天', getEl('wd-count').textContent, '3');
+ok('提示显示周一/四/六', getEl('wd-hint').textContent.includes('周一/四/六'), getEl('wd-hint').textContent);
+
+/* 保存并验证排期跟随自定义星期（固定今天 = 2026-09-11 周五） */
+getEl('f-date').value = isoToday;
+getEl('btnSave').onclick();
+const savedWd = JSON.parse(store.get('fitnessPlan.v1.profile'));
+ok('保存写入自定义训练日数组', JSON.stringify(savedWd.trainingWeekdays) === JSON.stringify([0, 3, 5]),
+  JSON.stringify(savedWd.trainingWeekdays));
+const todayCustom = gotoTab('today');
+ok('周五不在所选训练日时显示休息日', todayCustom.includes('今天是休息日'), todayCustom.slice(0, 140));
+const planCustom = gotoTab('plan');
+const around = (needle, len) => { const i = planCustom.indexOf(needle); return i < 0 ? '' : planCustom.slice(i, i + len); };
+ok('计划页把周六（09-12）标为训练日', around('09-12', 400).includes('训练'), around('09-12', 400).slice(0, 160));
+ok('计划页把周日（09-13）标为休息', around('09-13', 400).includes('休息'), around('09-13', 400).slice(0, 160));
+ok('计划页把周五（09-11）标为已打卡/休息', /休息|已打卡/.test(around('09-11', 400)), around('09-11', 400).slice(0, 160));
 
 console.log(`\n通过 ${pass} 项${failures.length ? `，失败 ${failures.length} 项` : '，全部通过 ✅'}`);
 if (failures.length) {
