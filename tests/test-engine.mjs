@@ -1,6 +1,5 @@
 /**
- * 从 index.html 抽出 <script id="plan-engine"> 引擎代码，
- * 在 Node 中加载并断言计划生成规则。
+ * 直接加载 plan-engine.js，在 Node 中断言计划生成规则。
  * 运行： node tests/test-engine.mjs
  */
 import { readFileSync } from 'node:fs';
@@ -8,17 +7,9 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const htmlPath = join(here, '..', 'index.html');
-const html = readFileSync(htmlPath, 'utf8');
-
-const m = html.match(/<script id="plan-engine">([\s\S]*?)<\/script>/);
-if (!m) {
-  console.error('找不到 <script id="plan-engine"> 代码块');
-  process.exit(1);
-}
-const engineCode = m[1];
+const engineCode = readFileSync(join(here, '..', 'plan-engine.js'), 'utf8');
 if (/<\/script>/i.test(engineCode)) {
-  console.error('引擎代码块内含非法的结束标签');
+  console.error('引擎代码里不该再出现 script 结束标签');
   process.exit(1);
 }
 
@@ -469,6 +460,148 @@ for (const d of [2, 3, 4, 5, 6]) {
   const tl = E.buildTimeline({ ...prof, startDate: '2026-03-11' }, { logs: {} }, '2026-03-12', sunday, monday);
   eq('起始日之前不生成条目', Object.keys(tl).length, 5);
   eq('时间轴不越过起始日', tl[monday], undefined);
+}
+
+/* ------------------------------------------------------------------ 10b. 伤病限制 */
+{
+  const base = { heightCm: 175, weightKg: 80, goal: 'muscle_gain', trainingWeekdays: [0, 1, 3, 4], experience: 'intermediate', venue: 'gym', startDate: '2026-01-05' };
+  const clean = E.sessionFor(base, 1);
+  ok('无伤病时不跳过任何动作', clean.skippedCount === 0, String(clean.skippedCount));
+
+  /* 部位标注：每个动作都能取到涉及部位 */
+  ok('每个动作都有涉及部位', E.EXERCISES.every((x) => E.jointsOf(x).length > 0),
+    E.EXERCISES.filter((x) => !E.jointsOf(x).length).map((x) => x.id).join(','));
+  ok('部位常量共 8 个', E.JOINTS.length === 8);
+  ok('部位中文名齐全', E.JOINTS.every((j) => !!E.JOINT_CN[j]));
+
+  /* 腰受限：下肢铰链类会被剔除或替换 */
+  const back = E.normalizeProfile({ ...base, injuries: ['lower_back'] });
+  eq('伤病字段被规范化保留', back.injuries.length, 1);
+  const sBack = E.sessionFor(back, 1);
+  ok('腰受限后不安排涉及腰的动作',
+    sBack.exercises.filter((x) => !x.skipped).every((x) => E.jointsOf(E.EXERCISES.filter((z) => z.id === x.id)[0] || { pattern: x.pattern, id: x.id }).indexOf('lower_back') < 0),
+    sBack.exercises.map((x) => x.id).join(','));
+
+  /* 全部动作都涉及受限部位 → 跳过条目，但这一天仍然有效 */
+  const allJoints = E.JOINTS.slice();
+  const blocked = E.normalizeProfile({ ...base, injuries: allJoints });
+  const sBlocked = E.sessionFor(blocked, 1);
+  eq('全部受限时所有动作被跳过', sBlocked.skippedCount, sBlocked.exercises.length);
+  ok('跳过条目有明确说明', sBlocked.exercises.every((x) => x.skipped && x.name.indexOf('今日跳过') === 0));
+  ok('跳过条目组数为 0', sBlocked.exercises.every((x) => x.sets === 0));
+  ok('跳过条目给出安全替代建议', sBlocked.exercises.every((x) => x.cues.length > 6));
+  ok('全部跳过时仍给出提示', sBlocked.warnings.join('').includes('仍然是有效训练日'));
+  ok('全部跳过时训练日序号照常', E.buildTimeline(blocked, { logs: {} }, '2026-01-05', '2026-01-08', '2026-01-05')['2026-01-08'].training === true);
+
+  /* 临时伤病只影响当天 */
+  const sTemp = E.sessionFor(base, 1, { extraJoints: ['knee'] });
+  ok('临时伤病生效', sTemp.limitedJoints.indexOf('knee') >= 0, JSON.stringify(sTemp.limitedJoints));
+  const sNoTemp = E.sessionFor(base, 1, { extraJoints: [] });
+  eq('不带临时伤病则不受影响', sNoTemp.limitedJoints.length, 0);
+
+  /* 模板级：受限时该模式被跳过时给出对应建议 */
+  const onePattern = E.normalizeProfile({ ...base, injuries: ['lower_back'] });
+  const sHinge = E.sessionFor(onePattern, 2);
+  ok('受限后不会出现涉及腰的动作', sHinge.exercises.filter((x) => !x.skipped).every((x) => {
+    const src = E.EXERCISES.filter((z) => z.id === x.id)[0];
+    return !src || E.jointsOf(src).indexOf('lower_back') < 0;
+  }));
+  ok('每个受限建议文案都存在',
+    Object.keys(E.PATTERN_JOINTS).every((p) => !!E.PATTERN_SAFE_ADVICE[p]),
+    Object.keys(E.PATTERN_JOINTS).filter((p) => !E.PATTERN_SAFE_ADVICE[p]).join(','));
+}
+
+/* ------------------------------------------------------------------ 10c. 反馈自适应 */
+{
+  const prof = E.normalizeProfile({
+    heightCm: 175, weightKg: 80, goal: 'muscle_gain', trainingWeekdays: [0, 2, 4],
+    experience: 'intermediate', venue: 'gym', startDate: '2026-01-05'
+  });
+  const dates = ['2026-01-05', '2026-01-07', '2026-01-09'];   /* 第 1 周的三个训练日 */
+  const today = '2026-01-09';
+  const mk = (fb, logs) => ({ logs: logs || dates.reduce((a, d) => (a[d] = { status: 'done' }, a), {}), feedback: fb });
+  const fbAll = (o) => dates.reduce((a, d) => (a[d] = o, a), {});
+
+  /* 无反馈 → 不调整 */
+  {
+    const a = E.adaptationFor(prof, mk({}, {}), 2, today);
+    eq('无反馈时不调整负重', a.loadFactor, 1);
+    eq('无反馈时不调整组数', a.setDelta, 0);
+    eq('无反馈时不标记已调整', a.applied, false);
+  }
+  /* 规则 1：疼痛优先 */
+  {
+    const fb = fbAll({ completion: 'all', rpe: 7, fatigue: 'ok', pain: { has: false, joints: [] } });
+    fb['2026-01-07'].pain = { has: true, joints: ['shoulder'] };
+    const a = E.adaptationFor(prof, mk(fb), 2, today);
+    eq('疼痛触发降量系数 0.9', +a.loadFactor.toFixed(4), 0.9);
+    eq('疼痛触发组数 −1', a.setDelta, -1);
+    eq('疼痛触发休息 +15 秒', a.restDelta, 15);
+    ok('疼痛部位被记录', a.painJoints.indexOf('shoulder') >= 0);
+  }
+  /* 规则 2：强度过高 */
+  {
+    const a = E.adaptationFor(prof, mk(fbAll({ completion: 'all', rpe: 9.5, fatigue: 'bad', pain: { has: false, joints: [] } })), 2, today);
+    eq('强度过高时负重 0.92', +a.loadFactor.toFixed(4), 0.92);
+    eq('强度过高时组数 −1', a.setDelta, -1);
+    ok('强度过高时给出理由', a.reasons.length > 0);
+  }
+  /* 规则 2b：完成度不足 */
+  {
+    const a = E.adaptationFor(prof, mk(fbAll({ completion: 'some', rpe: 7, fatigue: 'ok', pain: { has: false, joints: [] } })), 2, today);
+    eq('完成度不足时降量', +a.loadFactor.toFixed(4), 0.92);
+  }
+  /* 规则 3：训练次数不足则不进阶 */
+  {
+    const logs = { '2026-01-05': { status: 'done' } };
+    const a = E.adaptationFor(prof, mk(fbAll({ completion: 'all', rpe: 5, fatigue: 'good', pain: { has: false, joints: [] } }), logs), 2, today);
+    eq('出勤不足时不加量', a.loadFactor, 1);
+    eq('出勤不足时不加组', a.setDelta, 0);
+    eq('出勤不足时不算已调整', a.applied, false);
+  }
+  /* 规则 4：偏轻松且全勤 → 加量 */
+  {
+    const a = E.adaptationFor(prof, mk(fbAll({ completion: 'all', rpe: 5, fatigue: 'good', pain: { has: false, joints: [] } })), 2, today);
+    eq('偏轻松时负重 1.05', +a.loadFactor.toFixed(4), 1.05);
+    eq('偏轻松时组数 +1', a.setDelta, 1);
+    eq('偏轻松时休息 −5 秒', a.restDelta, -5);
+  }
+  /* 累积与上限保护 */
+  {
+    const dates2 = ['2026-01-05', '2026-01-07', '2026-01-09', '2026-01-12', '2026-01-14', '2026-01-16', '2026-01-19', '2026-01-21', '2026-01-23', '2026-01-26', '2026-01-28', '2026-01-30'];
+    const fb = {};
+    dates2.forEach((d) => { fb[d] = { completion: 'all', rpe: 5, fatigue: 'good', pain: { has: false, joints: [] } }; });
+    const logs = {};
+    dates2.forEach((d) => { logs[d] = { status: 'done' }; });
+    const a = E.adaptationFor(prof, { logs, feedback: fb }, 5, '2026-01-30');
+    ok('连续加量受 1.15 上限保护', a.loadFactor <= 1.15 + 1e-9, String(a.loadFactor));
+    ok('连续加组受 +2 保护', a.setDelta <= 2, String(a.setDelta));
+    const fb2 = {};
+    dates2.forEach((d) => { fb2[d] = { completion: 'all', rpe: 9.5, fatigue: 'bad', pain: { has: true, joints: ['knee'] } }; });
+    const b = E.adaptationFor(prof, { logs, feedback: fb2 }, 5, '2026-01-30');
+    ok('连续降量受 0.7 下限保护', b.loadFactor >= 0.7 - 1e-9, String(b.loadFactor));
+    ok('连续降组受 −2 保护', b.setDelta >= -2, String(b.setDelta));
+  }
+  /* 自适应叠加到训练内容上 */
+  {
+    const fb = fbAll({ completion: 'all', rpe: 9.5, fatigue: 'bad', pain: { has: false, joints: [] } });
+    const withFb = E.sessionFor(prof, 4, { progress: mk(fb), todayISO: today });
+    const withoutFb = E.sessionFor(prof, 4, { progress: mk({}, {}), todayISO: today });
+    eq('自适应后组数少于原计划', withFb.exercises[0].sets, withoutFb.exercises[0].sets - 1);
+    ok('自适应后负重低于原计划', withFb.exercises[0].loadRaw < withoutFb.exercises[0].loadRaw,
+      `${withFb.exercises[0].loadRaw} vs ${withoutFb.exercises[0].loadRaw}`);
+    ok('自适应后休息时间变长', withFb.exercises[0].restSec > withoutFb.exercises[0].restSec);
+    ok('给出本周已调整的提示', withFb.warnings.join('').includes('已按你的反馈调整'));
+    ok('组数不会低于 2', withFb.exercises.every((x) => x.skipped || x.sets >= 2));
+  }
+  /* 组数上限 */
+  {
+    const dates2 = ['2026-01-05', '2026-01-07', '2026-01-09', '2026-01-12', '2026-01-14', '2026-01-16', '2026-01-19', '2026-01-21', '2026-01-23'];
+    const fb = {}, logs = {};
+    dates2.forEach((d) => { fb[d] = { completion: 'all', rpe: 5, fatigue: 'good', pain: { has: false, joints: [] } }; logs[d] = { status: 'done' }; });
+    const s = E.sessionFor(prof, 10, { progress: { logs, feedback: fb }, todayISO: '2026-01-23' });
+    ok('组数不会超过 6', s.exercises.every((x) => x.skipped || x.sets <= 6), s.exercises.map((x) => x.sets).join(','));
+  }
 }
 
 /* ------------------------------------------------------------------ 11. 方案校验与规范化 */
